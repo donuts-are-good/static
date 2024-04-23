@@ -2,9 +2,14 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"time"
@@ -14,7 +19,6 @@ import (
 
 const serVer = "v1.0.0"
 
-var slidingWindowDuration = 60 * time.Second
 var startTime time.Time
 var requestTimestamps = struct {
 	sync.Mutex
@@ -22,14 +26,76 @@ var requestTimestamps = struct {
 }{}
 
 func main() {
+	helpBool := flag.Bool("help", false, "display help")
+	port := flag.String("port", "3456", "port to listen on")
+	staticFileDir := flag.String("directory", "./web", "directory from which static files are served")
+	slidingWindowDuration := flag.Duration("statswindow", 60*time.Second, "duration for calculating request statistics")
+
+	flag.Parse()
+
+	if *helpBool {
+		fmt.Println("Static Server " + serVer)
+		fmt.Println("")
+		fmt.Println("Usage:")
+		fmt.Println("--help        display help")
+		fmt.Println("--port        specify the port to listen on (default: " + *port + ")")
+		fmt.Println("--directory   specify the directory from which static files are served (default: ./web)")
+		fmt.Println("--statswindow specify the duration for calculating request statistics (default: 60 seconds)")
+		fmt.Println("")
+		fmt.Println("Description:")
+		fmt.Println(" Static Server is an HTTP server designed to serve static files efficiently. Static Server has directory listing turned off by default.")
+		fmt.Println("")
+		fmt.Println("Usage Examples:")
+		fmt.Println(" Run the server with default settings:")
+		fmt.Println("    $ ./static-server")
+		fmt.Println(" Run the server on a different port:")
+		fmt.Println("    $ ./static-server --port 8080")
+		fmt.Println(" Serve static files from a different directory:")
+		fmt.Println("    $ ./static-server --directory /path/to/static/files")
+		fmt.Println(" Change the duration for calculating request statistics:")
+		fmt.Println("    $ ./static-server --statswindow 120s")
+		fmt.Println("")
+		fmt.Println("Endpoints:")
+		fmt.Println(" - /: Serves the 'it works' page.")
+		fmt.Println(" - /stats: Provides server statistics in JSON format.")
+		fmt.Println(" - /favicon.ico: Serves the favicon.")
+		fmt.Println(" - /static/: Serves static files from the specified static directory. Default: " + *staticFileDir)
+		fmt.Println("")
+		fmt.Println("Note:")
+		fmt.Println(" The server listens on port " + *port + " by default.")
+		return
+	}
+
+	initFolders(*staticFileDir)
+
+	faviconPath := filepath.Join(*staticFileDir, "favicon.ico")
+	if _, err := os.Stat(faviconPath); errors.Is(err, os.ErrNotExist) {
+		resp, err := http.Get("https://raw.githubusercontent.com/donuts-are-good/static/master/favicon.ico")
+		if err != nil {
+			log.Fatalf("Error downloading favicon: %v", err)
+		}
+		defer resp.Body.Close()
+
+		out, err := os.Create(faviconPath)
+		if err != nil {
+			log.Fatalf("Error creating favicon file: %v", err)
+		}
+		defer out.Close()
+
+		_, err = io.Copy(out, resp.Body)
+		if err != nil {
+			log.Fatalf("Error writing favicon file: %v", err)
+		}
+	}
+
 	startTime = time.Now()
 
 	r := mux.NewRouter().StrictSlash(true)
 	r.Use(loggingMiddleware)
 
-	staticFileDir := http.Dir("./web")
 	staticFileHandler := http.StripPrefix("/static/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		file, err := staticFileDir.Open(r.URL.Path)
+		filePath := filepath.Join(*staticFileDir, r.URL.Path)
+		file, err := os.Open(filePath)
 		if err != nil {
 			http.Error(w, "HTTP 404: Static Server "+serVer+" - File not found", http.StatusNotFound)
 			return
@@ -47,7 +113,7 @@ func main() {
 			return
 		}
 
-		http.FileServer(staticFileDir).ServeHTTP(w, r)
+		http.ServeFile(w, r, filePath)
 	}))
 	r.PathPrefix("/static/").Handler(staticFileHandler)
 
@@ -88,7 +154,7 @@ func main() {
 	r.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
-		ramUse, threadsUse, uptimeStr, requests := stats()
+		ramUse, threadsUse, uptimeStr, requests := stats(*slidingWindowDuration)
 		data := map[string]interface{}{
 			"Name":           "Static Server - https://github.com/donuts-are-good/static",
 			"Version":        serVer,
@@ -112,7 +178,16 @@ func main() {
 		http.ServeFile(w, r, "./web/favicon.ico")
 	})
 
-	http.ListenAndServe(":3456", r)
+	http.ListenAndServe(":"+*port, r)
+}
+
+func initFolders(dir string) {
+	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+		err := os.MkdirAll(dir, os.ModePerm)
+		if err != nil {
+			log.Fatalf("Error creating directory: %v", err)
+		}
+	}
 }
 
 func loggingMiddleware(next http.Handler) http.Handler {
@@ -129,7 +204,7 @@ func loggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func stats() (string, string, string, int) {
+func stats(slidingWindowDuration time.Duration) (string, string, string, int) {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 	ramUse := fmt.Sprintf("%v MiB", bToMb(m.Sys))
